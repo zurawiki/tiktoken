@@ -4,6 +4,8 @@
 use std::collections::HashSet;
 use std::thread;
 
+use anyhow::anyhow;
+use anyhow::Result;
 use fancy_regex::Regex;
 use pyo3::exceptions;
 use pyo3::prelude::*;
@@ -179,7 +181,8 @@ fn hash_current_thread() -> usize {
 
 const MAX_NUM_THREADS: usize = 128;
 #[pyclass]
-struct CoreBPE {
+#[derive(Clone)]
+pub struct CoreBPE {
     encoder: HashMap<Vec<u8>, usize>,
     special_tokens_encoder: HashMap<String, usize>,
     decoder: HashMap<usize, Vec<u8>>,
@@ -441,10 +444,45 @@ impl CoreBPE {
     }
 }
 
+/// Rust API
+impl CoreBPE {
+    // ====================
+    // Encoding
+    // ====================
+
+    pub fn encode_ordinary(&self, text: &str) -> Vec<usize> {
+        self._encode_ordinary_native(text)
+    }
+
+    pub fn encode(&self, text: &str, allowed_special: HashSet<&str>) -> Vec<usize> {
+        self._encode_native(text, &allowed_special).0
+    }
+
+    pub fn encode_with_special_tokens(&self, text: &str) -> Vec<usize> {
+        let allowed_special = self
+            .special_tokens_encoder
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        self._encode_native(text, &allowed_special).0
+    }
+
+    // ====================
+    // Decoding
+    // ====================
+
+    pub fn decode(&self, tokens: Vec<usize>) -> Result<String> {
+        match String::from_utf8(self._decode_native(&tokens)) {
+            Ok(text) => Ok(text),
+            Err(e) => Err(anyhow!("Unable to decode into a valid UTF-8 string: {}", e)),
+        }
+    }
+}
+
 #[pymethods]
 impl CoreBPE {
     #[new]
-    fn new(
+    pub fn new(
         encoder: HashMap<Vec<u8>, usize>,
         special_tokens_encoder: HashMap<String, usize>,
         pattern: &str,
@@ -492,41 +530,6 @@ impl CoreBPE {
     // Encoding
     // ====================
 
-    fn encode_ordinary(&self, py: Python, text: &str) -> Vec<usize> {
-        py.allow_threads(|| self._encode_ordinary_native(text))
-    }
-
-    fn encode(&self, py: Python, text: &str, allowed_special: HashSet<&str>) -> Vec<usize> {
-        py.allow_threads(|| self._encode_native(text, &allowed_special).0)
-    }
-
-    fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<usize> {
-        py.allow_threads(|| {
-            match std::str::from_utf8(bytes) {
-                Ok(text) => self._encode_ordinary_native(text),
-                Err(e) => {
-                    let text = unsafe { std::str::from_utf8_unchecked(&bytes[..e.valid_up_to()]) };
-                    let (tokens, last_piece_token_len) = self._encode_native(text, &HashSet::new());
-                    let (mut tokens, last_piece_token_len) =
-                        self._increase_last_piece_token_len(tokens, last_piece_token_len);
-                    if !tokens.is_empty() && last_piece_token_len > 0 {
-                        // Lop off the tokens from the last piece and run BPE on the remaining bytes
-                        // Somewhat niche, but this may not be correct if we'd have had a regex
-                        // split between the valid UTF-8 and the invalid bytes, which is why this
-                        // method is private
-                        let mut unstable_bytes =
-                            self._decode_native(&tokens[tokens.len() - last_piece_token_len..]);
-                        unstable_bytes.extend_from_slice(&bytes[e.valid_up_to()..]);
-
-                        tokens.truncate(tokens.len() - last_piece_token_len);
-                        tokens.extend(byte_pair_encode(&unstable_bytes, &self.encoder));
-                    }
-                    tokens
-                }
-            }
-        })
-    }
-
     fn encode_with_unstable(
         &self,
         py: Python,
@@ -552,7 +555,7 @@ impl CoreBPE {
         Err(PyErr::new::<exceptions::PyKeyError, _>(piece.to_owned()))
     }
 
-    fn encode_single_piece(&self, piece: &[u8]) -> Vec<usize> {
+    pub fn encode_single_piece(&self, piece: &[u8]) -> Vec<usize> {
         if let Some(token) = self.encoder.get(piece) {
             return vec![*token];
         }
@@ -563,12 +566,12 @@ impl CoreBPE {
     // Decoding
     // ====================
 
-    fn decode_bytes(&self, py: Python, tokens: Vec<usize>) -> Py<PyBytes> {
+    pub fn decode_bytes(&self, py: Python, tokens: Vec<usize>) -> Py<PyBytes> {
         let bytes = py.allow_threads(|| self._decode_native(&tokens));
         PyBytes::new(py, &bytes).into()
     }
 
-    fn decode_single_token_bytes(&self, py: Python, token: usize) -> PyResult<Py<PyBytes>> {
+    pub fn decode_single_token_bytes(&self, py: Python, token: usize) -> PyResult<Py<PyBytes>> {
         if let Some(bytes) = self.decoder.get(&token) {
             return Ok(PyBytes::new(py, bytes).into());
         }
@@ -582,7 +585,7 @@ impl CoreBPE {
     // Miscellaneous
     // ====================
 
-    fn token_byte_values(&self, py: Python) -> Vec<Py<PyBytes>> {
+    pub fn token_byte_values(&self, py: Python) -> Vec<Py<PyBytes>> {
         self.sorted_token_bytes
             .iter()
             .map(|x| PyBytes::new(py, x).into())
